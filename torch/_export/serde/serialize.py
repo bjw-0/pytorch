@@ -16,7 +16,7 @@ import sys
 import traceback
 import types
 import typing
-from collections import deque, namedtuple, OrderedDict
+from collections import namedtuple, OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -39,7 +39,6 @@ from torch._higher_order_ops.flat_apply import func_to_graphable
 from torch._higher_order_ops.user_kernel_hop import get_user_kernel_hop_info
 from torch._library.opaque_object import get_opaque_type_name, is_custom_class_obj
 from torch._subclasses.fake_tensor import FakeTensor, FakeTensorMode, is_fake_tensor
-from torch.export._tree_utils import is_equivalent
 from torch.fx._symbolic_trace import _ConstantAttributeType
 from torch.fx.experimental import symbolic_shapes
 from torch.fx.traceback import NodeSource
@@ -734,7 +733,8 @@ def _find_imported(name: str) -> Any:
     multiprocessing child.
     """
     module_name, _, attr = name.rpartition(".")
-    if not {"__main__", "__mp_main__"}.isdisjoint(module_name.split(".")):
+    parts = module_name.split(".")
+    if "__main__" in parts or "__mp_main__" in parts:
         raise SerializeError(
             f"{name} is in a __main__ module, which can differ between "
             "processes. Define it in another module."
@@ -743,12 +743,11 @@ def _find_imported(name: str) -> Any:
     # and any attribute read on a lazily loaded module loads it. isinstance
     # can read __class__ too. So lookups are static, types are checked with
     # issubclass(type(obj), ...), and only classes and functions are read
-    # further.
+    # further, which can run metaclass code of a class that is imported.
     module = sys.modules.get(module_name)
     if module is None:
         # A local or nested class has a qualified name that is not a module
         # name: it goes through a function or through a class of a module.
-        parts = module_name.split(".")
         owners = [sys.modules.get(".".join(parts[:i])) for i in range(1, len(parts))]
         if "<locals>" in parts or any(
             issubclass(type(inspect.getattr_static(owner, part, None)), type)
@@ -771,7 +770,7 @@ def _find_imported(name: str) -> Any:
         raise SerializeError(
             f"{name} cannot be found: module {module_name} has no attribute {attr}"
         )
-    if not issubclass(type(obj), (type, types.FunctionType, types.BuiltinFunctionType)):
+    if not issubclass(type(obj), (type, types.FunctionType)):
         raise SerializeError(f"{name} is not a class or function")
     return obj
 
@@ -809,7 +808,8 @@ def _check_flat_apply_inputs(where: str, inputs: Sequence[NamedArgument]) -> Non
     for inp in inputs:
         if inp.kind != ArgumentKind.POSITIONAL or inp.name:
             raise SerializeError(
-                f"{where} has a keyword input, which cannot be saved or loaded"
+                f"{where} has a keyword input or a named input, which cannot be "
+                "saved or loaded"
             )
         if inp.arg.type not in _FLAT_APPLY_INPUT_KINDS:
             raise SerializeError(
@@ -819,32 +819,58 @@ def _check_flat_apply_inputs(where: str, inputs: Sequence[NamedArgument]) -> Non
             )
 
 
-def _find_in_spec(spec: pytree.TreeSpec, pred: Callable[..., bool]) -> bool:
-    return pred(spec) or any(_find_in_spec(c, pred) for c in spec.children())
+def _is_plain(value: Any) -> bool:
+    if type(value) is list:
+        return all(map(_is_plain, value))
+    return value is None or type(value) in (str, int, bool)
 
 
-def _same_value(a: Any, b: Any) -> bool:
-    # Equality alone misses a value that JSON stores as its base type, such as
-    # an IntEnum or a str subclass, because it compares equal to that value.
-    if type(a) is not type(b):
-        return False
-    if isinstance(a, dict):
-        return len(a) == len(b) and all(
-            _same_value(ka, kb) and _same_value(va, vb)
-            for (ka, va), (kb, vb) in zip(a.items(), b.items())
-        )
-    if isinstance(a, (list, tuple, deque)):
-        return len(a) == len(b) and all(map(_same_value, a, b))
-    if isinstance(a, (set, frozenset)):
-        return len(a) == len(b) and all(any(_same_value(x, y) for y in b) for x in a)
-    # A NaN does not equal itself, so it is refused. JSON loads every NaN as
-    # one shared object without its sign, which changes the dict keys and set
-    # members that it matches.
-    return a == b
+def _found_by_name(typ: Any) -> bool:
+    node_def = pytree.SUPPORTED_SERIALIZED_TYPES.get(typ)
+    name = node_def.serialized_type_name if node_def is not None else None
+    return name is not None and pytree.SERIALIZED_TYPE_TO_PYTHON_TYPE.get(name) is typ
 
 
-def _same_spec_node(t1: Any, c1: Any, t2: Any, c2: Any) -> bool:
-    return t1 is t2 and _same_value(c1, c2)
+def _context_codec(typ: Any) -> str | None:
+    # "json" for no codec of its own, "namedtuple" for pytree's namedtuple node.
+    if not _found_by_name(typ):
+        return None
+    if pytree.SUPPORTED_SERIALIZED_TYPES[typ].from_dumpable_context is None:
+        return "json"
+    return "namedtuple" if typ is namedtuple else None
+
+
+def _namedtuple_context_saves(context: Any) -> bool:
+    # Load calls the context class with the children of the node.
+    return pytree.is_namedtuple_class(context) and _found_by_name(context)
+
+
+def _saves_exactly(spec: pytree.TreeSpec) -> bool:
+    # A closed rule, because comparing the spec with a loaded copy misses values
+    # that compare equal but differ, such as an IntEnum and its int.
+    if spec.is_leaf():
+        return True
+    codec = _context_codec(spec.type)
+    if codec == "namedtuple":
+        context_saves = _namedtuple_context_saves(spec.context)
+    else:
+        context_saves = codec == "json" and _is_plain(spec.context)
+    return context_saves and all(map(_saves_exactly, spec.children()))
+
+
+def _loads_only_saved_nodes(schema: Any) -> bool:
+    # Checked before decoding, as other decoders could import modules. A name that
+    # is not registered is left to pytree, whose error says what to import.
+    if schema["type"] is None:
+        return True
+    typ = pytree.SERIALIZED_TYPE_TO_PYTHON_TYPE.get(schema["type"])
+    codec = _context_codec(typ)
+    if codec == "namedtuple":
+        context = pytree.SERIALIZED_TYPE_TO_PYTHON_TYPE.get(schema["context"])
+        context_loads = context is None or _namedtuple_context_saves(context)
+    else:
+        context_loads = typ is None or codec == "json"
+    return context_loads and all(map(_loads_only_saved_nodes, schema["children_spec"]))
 
 
 def _find_flat_apply_func(
@@ -876,7 +902,9 @@ def _find_flat_apply_func(
             raise SerializeError(
                 f"{name} is not a tensor subclass that export builds: no "
                 "__init__ in its class hierarchy is decorated with "
-                "torch._export.wrappers.mark_subclass_constructor_exportable_experimental"
+                "torch._export.wrappers.mark_subclass_constructor_exportable_experimental. "
+                "A decorator on top of it has to keep the mark, for example with "
+                "functools.wraps."
             )
         return func
     if (
@@ -894,12 +922,12 @@ def _find_flat_apply_func(
     # class name in kwargs then makes the call fail. Only the spec is read,
     # because rebuilding the inputs would run the code of registered pytree types
     # on graph nodes instead of the values they stand for.
-    pair = in_spec.children() if in_spec.type is tuple else []
+    children = in_spec.children() if in_spec.type is tuple else []
     if (
-        len(pair) != 2
-        or pair[0].type is not tuple
-        or pair[0].num_children == 0
-        or not pair[0].child(0).is_leaf()
+        len(children) != 2
+        or children[0].type is not tuple
+        or children[0].num_children == 0
+        or not children[0].child(0).is_leaf()
     ):
         raise SerializeError("Expected an autograd function name as the first input")
     _check_autograd_function(flat_args[0])
@@ -920,17 +948,24 @@ def _check_autograd_function(name: Any) -> None:
         and issubclass(function_cls, torch.autograd.Function)
     ):
         raise SerializeError(f"{name} is not a torch.autograd.Function")
+    # apply is a classmethod, so the mark is on the function inside it.
     if not any(
-        _is_allowed_in_pre_dispatch_graph(
-            getattr(vars(c).get("apply"), "__func__", None)
-        )
+        type(apply := vars(c).get("apply")) is classmethod
+        and _is_allowed_in_pre_dispatch_graph(apply.__func__)
         for c in function_cls.__mro__
     ):
         raise SerializeError(
             f"{name} is not a torch.autograd.Function that export calls: no "
             "apply in its class hierarchy is decorated with "
-            "torch._export.wrappers.allow_in_pre_dispatch_graph"
+            "torch._export.wrappers.allow_in_pre_dispatch_graph. A decorator on "
+            "top of it has to keep the mark, for example with functools.wraps."
         )
+
+
+def _check_autograd_helper_call(where: str, inputs: Sequence[NamedArgument]) -> None:
+    # Export does not write direct calls of the helper, outside flat_apply.
+    _check_flat_apply_inputs(where, inputs)
+    _check_autograd_function(inputs[0].arg.value if inputs else None)
 
 
 @final
@@ -1286,10 +1321,16 @@ class GraphModuleSerializer(metaclass=Final):
         elif callable(node.target):
             # Handle predispatch wrapper functions (vmap, JVP, etc.) that appear
             # as plain Python function call_function nodes in pre_dispatch graphs.
+            inputs = self.serialize_hoo_inputs(node.args, node.kwargs)
+            if (
+                node.target
+                is torch.export.custom_ops._call_custom_autograd_function_in_pre_dispatch
+            ):
+                _check_autograd_helper_call(f"node {node.name}", inputs)
             ex_node = Node(
                 name=node.name,
                 target=self.serialize_operator(node.target),
-                inputs=self.serialize_hoo_inputs(node.args, node.kwargs),
+                inputs=inputs,
                 outputs=self.serialize_hoo_outputs(node),
                 metadata=self.serialize_metadata(node),
             )
@@ -1505,6 +1546,18 @@ class GraphModuleSerializer(metaclass=Final):
         ``deserialize_flat_apply_inputs`` reverses this.
         """
         func, in_spec, *flat_args = node.args
+        # A dict result and a single list result are saved as one list of
+        # tensors, but load reads one saved result as a tensor or a scalar.
+        result = node.meta.get("val")
+        if isinstance(result, dict) or (
+            isinstance(result, tuple)
+            and len(result) == 1
+            and isinstance(result[0], list)
+        ):
+            raise SerializeError(
+                f"Cannot serialize flat_apply node {node.name}: load cannot read a "
+                "dict result or a single result that is a list"
+            )
         owner = node.graph.owning_module
         func_spec, in_spec_value = (
             torch.fx.graph_module._get_attr(owner, arg.target)
@@ -1523,26 +1576,18 @@ class GraphModuleSerializer(metaclass=Final):
                 f"Cannot serialize flat_apply node {node.name}: expected its function "
                 "and input spec to be TreeSpec graph attributes"
             )
-        if _find_in_spec(in_spec_value, lambda s: pytree.is_constant_class(s.type)):
-            raise SerializeError(
-                f"Cannot serialize flat_apply node {node.name}: an input is a "
-                "pytree constant, which an input spec cannot store"
-            )
         try:
             in_spec_str = self.serialize_treespec(in_spec_value)
-            # Load refuses enums and defaultdict factories, which import modules.
-            loaded_spec = pytree._treespec_loads_without_imports(in_spec_str)
         except Exception as e:
             raise SerializeError(
                 f"Cannot serialize flat_apply node {node.name}: its input spec "
                 f"cannot be saved: {e}"
             ) from e
-        if not is_equivalent(loaded_spec, in_spec_value, _same_spec_node):
+        if not _saves_exactly(in_spec_value):
             raise SerializeError(
-                f"Cannot serialize flat_apply node {node.name}: its input spec "
-                "would load back different, for example because JSON cannot store "
-                "a tuple, an int subclass or a NaN in it, or because another type "
-                "took the serialized name of one of its types"
+                f"Cannot serialize flat_apply node {node.name}: its input spec would "
+                "not load back the same. It can hold only namedtuples, and types with "
+                "no context codec whose contexts hold only None, str, int, bool and lists"
             )
         try:
             constant_func = pytree._retrieve_constant(func_spec).func
@@ -3094,12 +3139,14 @@ class GraphModuleDeserializer(metaclass=Final):
             self.deserialize_outputs(serialized_node, fx_node)
         elif callable(target):
             # Handle predispatch wrapper functions (vmap, JVP, etc.)
-            args, kwargs = self.deserialize_hoo_inputs(serialized_node.inputs)
             if (
                 target
                 is torch.export.custom_ops._call_custom_autograd_function_in_pre_dispatch
             ):
-                _check_autograd_function(args[0] if args else None)
+                _check_autograd_helper_call(
+                    f"node {serialized_node.name}", serialized_node.inputs
+                )
+            args, kwargs = self.deserialize_hoo_inputs(serialized_node.inputs)
             name = serialized_node.name if serialized_node.name else None
             fx_node = self.graph.create_node(
                 "call_function", target, args, kwargs, name
@@ -3472,8 +3519,12 @@ class GraphModuleDeserializer(metaclass=Final):
             )
         flat_inputs = inputs[1:]
         try:
-            # Loading an enum or a defaultdict factory would import a module
-            # that the file names.
+            if not _loads_only_saved_nodes(json.loads(flat_apply_spec.in_spec)[1]):
+                raise SerializeError(
+                    "it has a node that save does not write: a type with its own "
+                    "context codec, or a namedtuple whose context is another class"
+                )
+            # Loading an enum would import a module that the file names.
             in_spec = pytree._treespec_loads_without_imports(flat_apply_spec.in_spec)
         except Exception as e:
             raise SerializeError(

@@ -381,8 +381,9 @@ def load(
     A program can call tensor subclasses and custom autograd functions. Load
     finds them by name in modules that are already imported. It does not import
     the modules that the file names for them, because importing a module runs
-    its code. So import the module that each ``__module__`` names before
-    loading::
+    its code. So import the module that defines each of them (its
+    ``__module__``), and the modules that register the pytree types of their
+    inputs, before loading::
 
         import my_project.ops  # defines a custom autograd function the program calls
 
