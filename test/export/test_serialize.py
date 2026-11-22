@@ -2120,6 +2120,73 @@ class TestSaveLoad(TestCase):
         self.assertEqual(loaded.state_dict(), m.state_dict())
         save(loaded_ep, io.BytesIO())
 
+    def test_save_writes_tensor_storages(self):
+        from torch.export.pt2_archive._package import PT2ArchiveWriter
+
+        class Module(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.linear = torch.nn.Linear(4, 4)
+                self.register_buffer("scale", torch.rand(4).to(torch.bfloat16))
+                self.table = torch.arange(8.0).view(2, 4)
+
+            def forward(self, x):
+                return self.linear(x) * self.scale + self.table[1]
+
+        ep = export(Module(), (torch.randn(2, 4),), strict=True)
+        self.assertTrue(ep.constants)
+
+        buffer = io.BytesIO()
+        with (
+            patch.object(
+                PT2ArchiveWriter,
+                "write_bytes",
+                autospec=True,
+                side_effect=PT2ArchiveWriter.write_bytes,
+            ) as write_bytes,
+            patch.object(
+                PT2ArchiveWriter,
+                "write_storage",
+                autospec=True,
+                side_effect=PT2ArchiveWriter.write_storage,
+            ) as write_storage,
+        ):
+            save(ep, buffer)
+
+        def is_tensor_record(name):
+            return name.startswith(
+                ("data/weights/", "data/constants/")
+            ) and not name.endswith(".json")
+
+        self.assertFalse(
+            [
+                c.args[1]
+                for c in write_bytes.call_args_list
+                if is_tensor_record(c.args[1])
+            ]
+        )
+        stored = {c.args[1]: c.args[2] for c in write_storage.call_args_list}
+        self.assertEqual(len(stored), len(ep.state_dict) + len(ep.constants))
+
+        # Records keep their CRC32, so zip readers can still check them.
+        buffer.seek(0)
+        with zipfile.ZipFile(buffer) as archive:
+            self.assertIsNone(archive.testzip())
+            root = archive.namelist()[0].split("/")[0]
+            for name, storage in stored.items():
+                self.assertEqual(archive.read(f"{root}/{name}"), bytes(storage))
+
+        buffer.seek(0)
+        loaded_ep = load(buffer)
+        for expected, actual in (
+            (ep.state_dict, loaded_ep.state_dict),
+            (ep.constants, loaded_ep.constants),
+        ):
+            self.assertEqual(expected.keys(), actual.keys())
+            for key, tensor in expected.items():
+                self.assertEqual(actual[key].dtype, tensor.dtype)
+                self.assertTrue(torch.equal(actual[key], tensor))
+
     def test_deserialize_torch_artifact_dict(self):
         data = {"key": torch.tensor([1, 2, 3])}
         buf = io.BytesIO()

@@ -142,6 +142,18 @@ class PT2ArchiveWriter:
             raise AssertionError(f"Expected bytes but got {type(data)}")
         self.archive_file.write_record(name, data, len(data))
 
+    def write_storage(self, name: str, storage: torch.UntypedStorage) -> None:
+        """
+        Write the bytes of a CPU storage to the archive without copying them.
+        name: The destination file inside the archive.
+        storage: The storage to write.
+        """
+        if not isinstance(storage, torch.UntypedStorage):
+            raise AssertionError(f"Expected UntypedStorage but got {type(storage)}")
+        if storage.device.type != "cpu":
+            raise AssertionError(f"Expected a CPU storage but got {storage.device}")
+        self.archive_file.write_record(name, storage, storage.nbytes())
+
     def write_string(self, name: str, data: str) -> None:
         """
         Write a string object to the archive.
@@ -336,31 +348,32 @@ def _is_tensor_subclass(t: torch.Tensor) -> bool:
     return isinstance(t, torch.Tensor) and type(t.data) is not torch.Tensor
 
 
+def _get_raw_tensor_storage(value: torch.Tensor) -> torch.UntypedStorage | None:
+    """
+    Get the CPU untyped storage of a tensor, which is saved as the tensor's raw
+    bytes in the pt2 archive. Tensor metadata is stored separately. Returns None
+    for fake and empty tensors, which are saved as empty records.
+    """
+    if _is_fake_tensor(value) or not value.data_ptr():
+        return None
+    # The storage keeps the CPU copy of a device tensor alive while it is written.
+    return value.cpu().untyped_storage()
+
+
 def _get_raw_tensor_bytes(value: torch.Tensor) -> bytes:
     """
     Get the raw bytes of a tensor. This is used to save the tensor in pt2 archive.
     """
-    # NOTE: don't chain .cpu() with .data_ptr(). If an HtoD copy needs to be
-    # performed, the CPU copy needs to be kept alive when its underlying
-    # memory is accessed.
     import ctypes
 
-    if _is_fake_tensor(value):
-        value_bytes = b""
-    elif value.data_ptr():
-        cpu_tensor = value.cpu()
-        value_untyped_storage = cpu_tensor.untyped_storage()
-        # we store the raw bytes the untyped storage. Tensor metadata is stored separately
-        value_bytes = bytes(
-            ctypes.cast(
-                value_untyped_storage.data_ptr(),
-                ctypes.POINTER(ctypes.c_ubyte * value_untyped_storage.size()),
-            ).contents
-        )
-    else:
-        # for empty tensor
-        value_bytes = b""
-    return value_bytes
+    storage = _get_raw_tensor_storage(value)
+    if storage is None:
+        return b""
+    return bytes(
+        ctypes.cast(
+            storage.data_ptr(), ctypes.POINTER(ctypes.c_ubyte * storage.nbytes())
+        ).contents
+    )
 
 
 def _should_use_pickle(t: torch.Tensor) -> bool:
@@ -416,8 +429,13 @@ def _save_raw_tensors(
 
         path_name = f"{filename_prefix}{idx}"
         archive_path = os.path.join(directory, path_name)
-        tensor_bytes = _get_raw_tensor_bytes(complete_tensor)
-        archive_writer.write_bytes(archive_path, tensor_bytes)
+        # Write the storage itself: copying it into bytes first costs a copy
+        # of every weight, and the bytes overload of write_record copies again.
+        storage = _get_raw_tensor_storage(complete_tensor)
+        if storage is None:
+            archive_writer.write_bytes(archive_path, b"")
+        else:
+            archive_writer.write_storage(archive_path, storage)
         idx += 1
 
         for _, item_fqn in group:
